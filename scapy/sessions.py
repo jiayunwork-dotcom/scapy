@@ -78,7 +78,7 @@ class DefaultSession(object):
 
 
 class IPSession(DefaultSession):
-    """Defragment IP packets 'on-the-flow'.
+    """Defragment IP and IPv6 packets 'on-the-flow'.
 
     Usage:
     >>> sniff(session=IPSession)
@@ -88,17 +88,24 @@ class IPSession(DefaultSession):
         # type: (*Any, **Any) -> None
         DefaultSession.__init__(self, *args, **kwargs)
         self.fragments = defaultdict(list)  # type: DefaultDict[Tuple[Any, ...], List[Packet]]  # noqa: E501
+        self.fragments6 = defaultdict(list)  # type: DefaultDict[Tuple[Any, ...], List[Packet]]  # noqa: E501
 
     def process(self, packet: Packet) -> Optional[Packet]:
         from scapy.layers.inet import BadFragments, IP, _defrag_ip_pkt
         if not packet:
             return None
-        if IP not in packet:
-            return packet
-        try:
-            return _defrag_ip_pkt(packet, self.fragments)[1]  # type: ignore
-        except BadFragments:
-            return None
+        if IP in packet:
+            try:
+                return _defrag_ip_pkt(packet, self.fragments)[1]  # type: ignore
+            except BadFragments:
+                return None
+        from scapy.layers.inet6 import BadFragments6, IPv6, defrag6_pkt
+        if IPv6 in packet:
+            try:
+                return defrag6_pkt(packet, self.fragments6)[1]  # type: ignore
+            except BadFragments6:
+                return None
+        return packet
 
 
 class StringBuffer(object):

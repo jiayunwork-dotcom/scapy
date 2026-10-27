@@ -1929,6 +1929,91 @@ frags = fragment6(pkt, 100)
 pkt = defragment6(Ether(raw(frag / Padding(b'a' * 8))) for frag in frags)
 assert b'a' not in pkt.data
 
+
+############
+############
++ Test IPSession IPv6 defragmentation
+
+= IPSession - reassembles IPv6 fragments on-the-flow
+packet = IPv6(src="2001:db8::1", dst="2001:db8::2")/UDP(sport=1234, dport=4321)/Raw(b"A" * 300)
+frags = fragment6(packet, 100)
+session = IPSession()
+assert all(session.process(frag) is None for frag in frags[:-1])
+reassembled = session.process(frags[-1])
+assert raw(reassembled) == raw(packet)
+assert raw(reassembled) == raw(defragment6(frags))
+assert IPv6ExtHdrFragment not in reassembled
+assert reassembled.plen == 308 and reassembled.nh == 17 and UDP in reassembled
+
+= IPSession - last fragment first and interleaved datagrams
+packet1 = IPv6(src="2001:db8::1", dst="2001:db8::2")/UDP(sport=1, dport=2)/Raw(b"A" * 300)
+packet2 = IPv6(src="2001:db8::3", dst="2001:db8::4")/TCP()/Raw(b"B" * 200)
+frags1 = fragment6(packet1, 100)
+frags2 = fragment6(packet2, 80)
+session = IPSession()
+stream = [frags1[-1], frags2[-1], frags1[0], frags2[0], frags1[3], frags2[2], frags1[1], frags2[1], frags1[2], frags1[4], frags2[3], frags1[5], frags2[4], frags2[5]]
+out = [p for p in (session.process(frag) for frag in stream) if p]
+assert len(out) == 2
+assert raw(out[0]) == raw(packet1) and raw(out[1]) == raw(packet2)
+assert raw(out[0]) == raw(defragment6(frags1))
+assert raw(out[1]) == raw(defragment6(frags2))
+
+= IPSession - waits for a missing fragment and ignores a duplicate
+base = IPv6(src="::1", dst="::2")
+mkfrag = lambda off, m, data: base/IPv6ExtHdrFragment(id=10, offset=off, m=m)/Raw(data)
+session = IPSession()
+assert session.process(mkfrag(0, 1, b"a" * 8)) is None
+assert session.process(mkfrag(2, 0, b"c" * 8)) is None
+assert session.process(mkfrag(2, 0, b"c" * 8)) is None
+reassembled = session.process(mkfrag(1, 1, b"b" * 8))
+assert reassembled is not None
+assert reassembled[Raw].load == b"a" * 8 + b"b" * 8 + b"c" * 8
+assert not session.fragments6
+
+= IPSession - overlapping fragments drop the datagram and a same id restarts fresh
+mk = lambda fid, off, m, data: IPv6(src="::9", dst="::a")/IPv6ExtHdrFragment(id=fid, offset=off, m=m)/Raw(data)
+session = IPSession()
+assert session.process(mk(1, 0, 1, b"A" * 8)) is None
+assert session.process(mk(1, 0, 1, b"B" * 16)) is None
+assert not session.fragments6
+assert session.process(mk(2, 0, 1, b"D" * 8)) is None
+other = session.process(mk(2, 1, 0, b"E" * 8))
+assert other is not None and other[Raw].load == b"D" * 8 + b"E" * 8
+assert session.process(mk(1, 0, 1, b"F" * 8)) is None
+restarted = session.process(mk(1, 1, 0, b"G" * 8))
+assert restarted is not None and restarted[Raw].load == b"F" * 8 + b"G" * 8
+
+= IPSession - ICMPv6 errors quoting a fragment header are passed as-is
+quoted = IPv6(src="2001:db8::1", dst="2001:db8::2")/IPv6ExtHdrFragment(id=7, offset=2, m=1)/Raw(b"X" * 16)
+ptb = IPv6(src="2001:db8::3", dst="2001:db8::1")/ICMPv6PacketTooBig(mtu=1280)/quoted
+session = IPSession()
+assert session.process(ptb) is ptb
+assert not session.fragments6
+echo = IPv6()/ICMPv6EchoRequest()
+assert session.process(echo) is echo
+
+= IPSession - IPv4 and IPv6 coexist
+v4 = IP(src="10.0.0.1", dst="10.0.0.2")/ICMP()/b"hi"
+v6 = IPv6(src="::1", dst="::2")/ICMPv6EchoRequest()
+pkts = sniff(offline=[v4, v6] + fragment6(IPv6(src="::1", dst="::2")/Raw(b"Z" * 200), 100), session=IPSession)
+assert len(pkts) == 3
+assert raw(pkts[0]) == raw(v4) and raw(pkts[1]) == raw(v6)
+assert IPv6ExtHdrFragment not in pkts[2] and pkts[2][Raw].load == b"Z" * 200
+
+= IPSession - dissected fragments and independent sessions
+import random
+packet = IPv6(src="2001:db8::1", dst="2001:db8::2")/UDP(sport=1234, dport=4321)/Raw(b"A" * 300)
+frags = [IPv6(raw(frag)) for frag in fragment6(packet, 100)]
+random.seed(0)
+random.shuffle(frags)
+session1 = IPSession()
+session2 = IPSession()
+assert session2.process(frags[0]) is None
+assert not session1.fragments6
+out = [p for p in (session1.process(frag) for frag in frags) if p]
+assert len(out) == 1 and raw(out[0]) == raw(packet)
+assert not session1.fragments6
+
 ############
 ############
 + Test Route6 class

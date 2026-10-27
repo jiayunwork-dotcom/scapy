@@ -1237,6 +1237,96 @@ def defragment6(packets):
     return q
 
 
+class BadFragments6(ValueError):
+    def __init__(self, *args, **kwargs):
+        self.frags = kwargs.pop("frags", None)
+        super(BadFragments6, self).__init__(*args, **kwargs)
+
+
+def defrag6_pkt(pkt, frags):
+    """
+    Defragment a single IPv6 packet 'on-the-flow'.
+
+    The fragments of each datagram, identified by its source address,
+    destination address and Fragment Header identification, are stored in
+    the 'frags' defaultdict until the datagram is complete. A retransmission
+    of an identical fragment is ignored, while overlapping fragments drop
+    the whole datagram. The actual reassembly is performed by
+    defragment6().
+
+    :param pkt: the new packet
+    :param frags: a defaultdict(list) used for storage
+    :return: a tuple ``(fragmented, defragmented_value)``. When the packet
+             belongs to a datagram that is not complete yet,
+             ``defragmented_value`` is None.
+    :raises BadFragments6: when two (non identical) fragments of the
+                           datagram overlap
+    """
+    if IPv6 not in pkt:
+        return False, pkt
+    # The Fragment Header must belong to the top-level IPv6 header's
+    # extension header chain, and not e.g. be embedded in the original
+    # packet quoted in an ICMPv6 error message.
+    frag_hdr = pkt[IPv6].payload
+    while isinstance(frag_hdr, _IPv6ExtHdr):
+        if isinstance(frag_hdr, IPv6ExtHdrFragment):
+            break
+        frag_hdr = frag_hdr.payload
+    else:
+        return False, pkt
+    ip6 = pkt[IPv6]
+    uid = (
+        inet_pton(socket.AF_INET6, ip6.src),
+        inet_pton(socket.AF_INET6, ip6.dst),
+        frag_hdr.id,
+    )
+    offset = frag_hdr.offset << 3
+    if ip6.plen is None:
+        fraglen = len(raw(frag_hdr.payload))
+    else:
+        fraglen = ip6.plen - 8  # size of the Fragment Header
+    end = offset + fraglen
+    curfrags = frags[uid]
+    for _, other_offset, other_len, _ in curfrags:
+        other_end = other_offset + other_len
+        if offset == other_offset and fraglen == other_len:
+            # Retransmission of the exact same fragment
+            return True, None
+        if offset < other_end and other_offset < end:
+            # Overlapping but not identical fragments: discard the
+            # whole datagram.
+            warning("Fragment overlap on %r" % pkt)
+            badfrags = [frag[0] for frag in curfrags]
+            badfrags.append(pkt)
+            del frags[uid]
+            raise BadFragments6(frags=badfrags)
+    curfrags.append((pkt, offset, fraglen, frag_hdr.m))
+    # The datagram is complete once a last fragment (M = 0) has been seen
+    # and the buffered fragments cover the whole fragmentable part, from
+    # offset 0 up to the end of that last fragment, without any gap.
+    last_end = None
+    for _, frag_offset, frag_len, frag_m in curfrags:
+        if not frag_m:
+            frag_end = frag_offset + frag_len
+            if last_end is None or frag_end > last_end:
+                last_end = frag_end
+    if last_end is None:
+        return True, None
+    ordered = sorted(curfrags, key=lambda x: (x[1], -x[2]))
+    cur_offset = 0
+    for _, frag_offset, frag_len, _ in ordered:
+        if frag_offset != cur_offset:
+            # A fragment is still missing
+            return True, None
+        cur_offset = frag_offset + frag_len
+    if cur_offset != last_end:
+        # Data past the last fragment, which is malformed
+        return True, None
+    reassembled = defragment6([frag[0] for frag in ordered])
+    del frags[uid]
+    return True, reassembled
+
+
 def fragment6(pkt, fragSize):
     """
     Performs fragmentation of an IPv6 packet. 'fragSize' argument is the
